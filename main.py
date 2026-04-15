@@ -1,6 +1,9 @@
-"""Daily job posting scraper — emails a CSV of matching postings."""
+"""Daily job posting scraper — emails a CSV of matching postings.
+
+JobSpy returns raw postings; Apollo is the sole source of truth for company
+size, industry, and country (JobSpy does not expose those fields).
+"""
 import os
-import re
 import smtplib
 import sys
 from datetime import datetime
@@ -10,6 +13,8 @@ from io import StringIO
 import pandas as pd
 from dotenv import load_dotenv
 from jobspy import scrape_jobs
+
+from enrich import enrich
 
 load_dotenv()
 
@@ -25,10 +30,8 @@ SEARCH_TERMS = [
     "Data Scientist",
     "Analytics Consultant",
     "Business Intelligence Engineer",
-    "BI Engineer",
     "BI Analyst",
     "Data Architect",
-    "AI/ML Engineer",
     "Applied AI Engineer",
     "GenAI Engineer",
     "LLM Engineer",
@@ -53,37 +56,6 @@ EXCLUDE_COMPANY_KEYWORDS = [
 ]
 
 
-def parse_employee_count(raw):
-    """Extract (min, max) employee count from strings like '51-200 employees'."""
-    if not raw or not isinstance(raw, str):
-        return (None, None)
-    s = raw.lower().replace(",", "")
-    nums = [int(n) for n in re.findall(r"\d+", s)]
-    if not nums:
-        return (None, None)
-    if len(nums) == 1:
-        return (nums[0], nums[0])
-    return (min(nums), max(nums))
-
-
-def in_target_size(raw):
-    lo, hi = parse_employee_count(raw)
-    if lo is None:
-        return False
-    # Overlap with [10, 100]
-    return hi >= 10 and lo <= 100
-
-
-def is_us_location(loc):
-    if not isinstance(loc, str):
-        return False
-    s = loc.lower()
-    if any(x in s for x in ["united states", "usa", ", us"]):
-        return True
-    # state abbreviations after a comma: ", CA" etc.
-    return bool(re.search(r",\s*[A-Z]{2}\b", loc))
-
-
 def industry_excluded(industry):
     if not isinstance(industry, str):
         return False
@@ -96,6 +68,13 @@ def company_excluded(company):
         return False
     s = company.lower()
     return any(k in s for k in EXCLUDE_COMPANY_KEYWORDS)
+
+
+def is_us_country(country):
+    if not isinstance(country, str):
+        return False
+    s = country.strip().lower()
+    return s in ("united states", "usa", "us", "u.s.", "u.s.a.")
 
 
 def scrape_all():
@@ -128,33 +107,58 @@ def filter_jobs(df):
     if df.empty:
         return df
 
-    # Normalize columns that may be missing on some sites
-    for col in ["company", "title", "job_url", "location",
-                "company_num_employees", "company_industry"]:
+    # Ensure expected columns exist — JobSpy's schema varies by site.
+    for col in ["company", "title", "job_url", "company_url"]:
         if col not in df.columns:
             df[col] = None
 
     df = df.dropna(subset=["company", "title"])
 
-    # US only
-    df = df[df["location"].apply(is_us_location)]
-
-    # Exclude staffing/nonprofit by industry
-    df = df[~df["company_industry"].apply(industry_excluded)]
-
-    # Exclude known job platforms / staffing agencies by company name
+    # Early exclude: known staffing / job-platform company names.
     df = df[~df["company"].apply(company_excluded)]
 
-    # 10-100 employees (requires the data; drop rows without it since we
-    # can't verify the size constraint)
-    df = df[df["company_num_employees"].apply(in_target_size)]
+    # Dedupe before enrichment so we don't pay Apollo for duplicates.
+    df = df.drop_duplicates(subset=["company", "title"]).reset_index(drop=True)
 
-    # Dedupe on company + title
-    df = df.drop_duplicates(subset=["company", "title"])
+    # Enrich every unique company via Apollo (US + 10-100 is filtered at the
+    # API level, so a returned record already satisfies those constraints).
+    unique_companies = df.drop_duplicates(subset=["company"])[
+        ["company", "company_url"]
+    ]
+    print(f"[enrich] unique companies to resolve: {len(unique_companies)}",
+          flush=True)
+    enrichment = {}
+    for _, row in unique_companies.iterrows():
+        enrichment[row["company"]] = enrich(row["company"], row.get("company_url"))
+
+    df["_employees"] = df["company"].map(
+        lambda c: enrichment.get(c, {}).get("employee_count")
+    )
+    df["_industry"] = df["company"].map(
+        lambda c: enrichment.get(c, {}).get("industry")
+    )
+    df["_country"] = df["company"].map(
+        lambda c: enrichment.get(c, {}).get("country")
+    )
+
+    # Drop rows Apollo couldn't resolve — we can't verify the constraints.
+    before = len(df)
+    df = df[df["_employees"].notna()]
+    print(f"[filter] dropped {before - len(df)} unresolved companies",
+          flush=True)
+
+    # Size: 10-100 employees (exact count from Apollo).
+    df = df[df["_employees"].apply(lambda n: 10 <= int(n) <= 100)]
+
+    # Company must be US-headquartered per Apollo.
+    df = df[df["_country"].apply(is_us_country)]
+
+    # Exclude staffing / nonprofit by Apollo's industry field.
+    df = df[~df["_industry"].apply(industry_excluded)]
 
     out = pd.DataFrame({
         "Company Name": df["company"],
-        "Company Number of Employees": df["company_num_employees"],
+        "Company Number of Employees": df["_employees"].astype(int),
         "Job Posting Title": df["title"],
         "Job Posting Link": df["job_url"],
     })
@@ -176,7 +180,8 @@ def send_email(csv_text, row_count):
     msg["To"] = to_addr
     msg.set_content(
         f"Attached: {row_count} job postings matching your filters "
-        f"(US, 10-100 employees, excluding staffing/nonprofits/job platforms)."
+        f"(US-headquartered, 10-100 employees per Apollo, excluding "
+        f"staffing/nonprofits/job platforms)."
     )
     msg.add_attachment(
         csv_text.encode("utf-8"),
