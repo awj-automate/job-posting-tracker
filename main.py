@@ -95,7 +95,7 @@ def main():
 
     # Dedupe across sites/search terms
     if not raw.empty:
-        raw = raw.drop_duplicates(subset=["company", "title"]).reset_index(drop=True)
+        raw = raw.drop_duplicates(subset=["company"]).reset_index(drop=True)
         print(f"[dedup] unique rows: {len(raw)}", flush=True)
 
     buf = StringIO()
