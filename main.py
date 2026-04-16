@@ -1,4 +1,5 @@
-"""Daily job posting scraper — emails raw results as a CSV."""
+"""Hourly Upwork scraper via Apify — emails matching postings as CSV."""
+import csv
 import os
 import smtplib
 import sys
@@ -6,62 +7,96 @@ from datetime import datetime
 from email.message import EmailMessage
 from io import StringIO
 
-import pandas as pd
+import requests
 from dotenv import load_dotenv
-from jobspy import scrape_jobs
 
 load_dotenv()
 
-SEARCH_TERMS = [
-    "Data Engineer",
-    "Data Analyst",
-    "AI Engineer",
-    "AI Consultant",
-    "AI Specialist",
-    "Analytics Engineer",
-    "Machine Learning Engineer",
-    "ML Engineer",
-    "Data Scientist",
-    "Analytics Consultant",
-    "Business Intelligence Engineer",
-    "BI Analyst",
-    "Data Architect",
-    "Applied AI Engineer",
-    "GenAI Engineer",
-    "LLM Engineer",
-    "Data Platform Engineer",
+APIFY_ACTOR = "jupri~upwork"
+APIFY_URL = (
+    f"https://api.apify.com/v2/acts/{APIFY_ACTOR}/run-sync-get-dataset-items"
+)
+
+ACTOR_INPUT = {
+    "age": 1,
+    "age_unit": "hour",
+    "client_location": ["United States"],
+    "contract_to_hire": False,
+    "dev_dataset_clear": False,
+    "dev_no_strip": False,
+    "fixed": True,
+    "hourly": True,
+    "hourly_min": 60,
+    "includes.attachments": False,
+    "includes.history": False,
+    "no_hires": False,
+    "payment_verified": False,
+    "previous_clients": False,
+    "price_min": 1000,
+    "query": [
+        "Data Analysis",
+        "Data Analyst",
+        "Salesforce Data",
+        "Data Pipeline",
+        "HubSpot Data",
+        "GA4 data",
+        "Data Dashboard",
+        "Data Analytics",
+    ],
+}
+
+CSV_FIELDS = [
+    "Date Posted",
+    "Title",
+    "Description",
+    "URL",
+    "Type",
+    "Fixed Price Budget",
+    "Hourly min",
+    "Hourly max",
+    "Duration",
 ]
 
-SITES = ["linkedin", "indeed", "zip_recruiter", "glassdoor", "google"]
+
+def fetch_jobs() -> list:
+    token = os.environ["APIFY_TOKEN"]
+    r = requests.post(
+        APIFY_URL,
+        params={"token": token},
+        json=ACTOR_INPUT,
+        timeout=600,
+    )
+    r.raise_for_status()
+    return r.json() or []
 
 
-def scrape_all():
-    frames = []
-    for term in SEARCH_TERMS:
-        print(f"[scrape] {term}", flush=True)
-        try:
-            df = scrape_jobs(
-                site_name=SITES,
-                search_term=term,
-                google_search_term=f"{term} jobs in United States since yesterday",
-                location="United States",
-                results_wanted=40,
-                hours_old=24,
-                country_indeed="USA",
-                linkedin_fetch_description=False,
-                verbose=0,
-            )
-            if df is not None and len(df) > 0:
-                df["search_term"] = term
-                frames.append(df)
-        except Exception as e:
-            print(f"  ! {term}: {e}", flush=True)
-    if not frames:
-        return pd.DataFrame()
-    return pd.concat(frames, ignore_index=True)
+def row_for(job: dict) -> dict:
+    fixed = job.get("fixed") or {}
+    hourly = job.get("hourly") or {}
+    duration = hourly.get("duration") or fixed.get("duration") or {}
+    return {
+        "Date Posted": job.get("ts_publish"),
+        "Title": job.get("title"),
+        "Description": job.get("description"),
+        "URL": job.get("url"),
+        "Type": job.get("type"),
+        "Fixed Price Budget": fixed.get("budget"),
+        "Hourly min": hourly.get("min"),
+        "Hourly max": hourly.get("max"),
+        "Duration": duration.get("label"),
+    }
 
 
-def send_email(csv_text, row_count):
+def build_csv(jobs: list) -> str:
+    buf = StringIO()
+    w = csv.DictWriter(buf, fieldnames=CSV_FIELDS)
+    w.writeheader()
+    for j in jobs:
+        w.writerow(row_for(j))
+    return buf.getvalue()
+
+
+def send_email(csv_text: str, row_count: int) -> None:
     host = os.environ["SMTP_HOST"]
     port = int(os.environ.get("SMTP_PORT", "587"))
     user = os.environ["SMTP_USER"]
@@ -69,17 +104,19 @@ def send_email(csv_text, row_count):
     to_addr = os.environ.get("EMAIL_TO", "jeinhorn92@gmail.com")
     from_addr = os.environ.get("EMAIL_FROM", user)
 
-    today = datetime.utcnow().strftime("%Y-%m-%d")
+    stamp = datetime.utcnow().strftime("%Y-%m-%d-%H%MZ")
     msg = EmailMessage()
-    msg["Subject"] = f"Job Postings — {today} ({row_count} results)"
+    msg["Subject"] = f"Upwork Postings — {stamp} ({row_count} results)"
     msg["From"] = from_addr
     msg["To"] = to_addr
-    msg.set_content(f"Attached: {row_count} raw job postings from today's scrape.")
+    msg.set_content(
+        f"Attached: {row_count} Upwork postings from the last hour."
+    )
     msg.add_attachment(
         csv_text.encode("utf-8"),
         maintype="text",
         subtype="csv",
-        filename=f"job-postings-{today}.csv",
+        filename=f"upwork-{stamp}.csv",
     )
 
     with smtplib.SMTP(host, port) as s:
@@ -89,18 +126,10 @@ def send_email(csv_text, row_count):
     print(f"[email] sent {row_count} rows to {to_addr}", flush=True)
 
 
-def main():
-    raw = scrape_all()
-    print(f"[scrape] total raw rows: {len(raw)}", flush=True)
-
-    # Dedupe across sites/search terms
-    if not raw.empty:
-        raw = raw.drop_duplicates(subset=["company"]).reset_index(drop=True)
-        print(f"[dedup] unique rows: {len(raw)}", flush=True)
-
-    buf = StringIO()
-    raw.to_csv(buf, index=False)
-    send_email(buf.getvalue(), len(raw))
+def main() -> None:
+    jobs = fetch_jobs()
+    print(f"[apify] fetched {len(jobs)} jobs", flush=True)
+    send_email(build_csv(jobs), len(jobs))
 
 
 if __name__ == "__main__":
