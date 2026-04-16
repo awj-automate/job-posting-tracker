@@ -42,6 +42,16 @@ ACTOR_INPUT = {
         "GA4 data",
         "Data Dashboard",
         "Data Analytics",
+        "dbt",
+        "data engineer",
+        "data engineering",
+        "data infrastructure",
+        "data",
+        "bigquery",
+        "sql",
+        "data scientist",
+        "looker studio",
+        "Power BI",
     ],
 }
 
