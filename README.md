@@ -36,8 +36,8 @@ python main.py
 3. In the service **Variables** tab, set:
    - `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`
    - `EMAIL_FROM`, `EMAIL_TO`
-4. In the service **Settings → Cron Schedule**, confirm: `0 10 * * *`
-   (10:00 UTC = 6:00 AM ET; adjust if you want a different timezone).
+4. In the service **Settings → Cron Schedule**, confirm: `0 12-23,0-2 * * *`
+   (hourly, 7 AM–9 PM EST; adjust if you want a different timezone).
 5. Deploy. Railway will run `python main.py` on schedule.
 
 ### Gmail SMTP
